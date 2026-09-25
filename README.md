@@ -1,121 +1,71 @@
 # exec-profile-agent
 
-A LangGraph agent that builds **citation-grounded executive profiles** from public web sources, using Gemini for extraction. Given a name, title, and company, it searches the web, extracts structured fields, and verifies that every claim is backed by a source it actually retrieved. Fields it cannot verify are left blank with a reason instead of being guessed.
-
-## Why I built this
-
-I previously built an LLM + web-search pipeline for a research project at Columbia Business School that generated background profiles for ~1,700 S&P 500 executives. That version relied on prompt instructions ("never fabricate", "cite reputable sources") to keep the model honest, and I found that wasn't enough: a model told to cite sources will sometimes produce citations that look right but don't exist in what it retrieved.
-
-This project is a rebuild with one main change: **reliability is enforced in code, not in the prompt.** Verification is a deterministic step in the graph, so the model can't talk its way past it.
-
-## How it works
+A LangGraph agent that turns *name + title + company* into a **citation-grounded professional profile**
+of a public-company executive — and leaves a field blank rather than invent it.
 
 ```
-START → search → extract → verify ─┬─ ok      → emit → END
-                    ▲              ├─ retry   → search   (bounded, max 2 attempts)
-                    └──────────────┘
-                                   └─ abstain → abstain → END
+START → search → retrieve → extract → verify ─┬─ ok      → summarize → END
+            ▲                                 ├─ retry   → search  (max 2 attempts)
+            └─────────────────────────────────┘
+                                              └─ abstain → abstain → summarize → END
 ```
 
-| Node | What it does |
-|---|---|
-| `search` | Queries the web (Tavily) for sources about the target person |
-| `extract` | Gemini fills a Pydantic schema via structured output; every non-null field must cite source URLs |
-| `verify` | Pure Python, no LLM. Checks that each cited URL appears in the retrieved results and that no value is uncited |
-| `abstain` | Strips citations that weren't retrieved, blanks unsupported fields, and records why |
+| Node | What it does | Why |
+|---|---|---|
+| `search` | Tavily web search; drops user-generated domains (Scribd, Reddit, social…); merges results across retries | evidence quality |
+| `retrieve` | **rag**: chunk full pages → Chroma → retrieve per field. **baseline**: first 400 chars of each snippet | targeted evidence instead of page openings |
+| `extract` | Gemini structured output; identity fields locked to the input | the model can't rename the person |
+| `verify` | **deterministic, no LLM**: every cited URL must be one we actually retrieved | a model can't grade its own citations |
+| `abstain` | blanks fields whose citations fail, records why | never fabricate |
+| `summarize` | LLM writes the summary from *verified fields only*; any number/year not in those fields → retry → template fallback | the summary can't smuggle in unverified facts |
 
-A few design decisions:
-
-- **Verification doesn't use an LLM.** It's deterministic, cheap, and can't be persuaded by the output it's checking.
-- **Retries are bounded** (`MAX_ATTEMPTS = 2`) with a refined query, so a hard case ends in abstention rather than an expensive loop.
-- **Blank beats wrong.** A null field with a note is treated as a correct outcome, not a failure.
-- **Professional information only.** The schema covers current role, education, prior roles, board seats, and notable facts. It deliberately excludes personal details.
-- **Transient API errors** (e.g., 503 under load) are handled with client-side exponential-backoff retries and a timeout.
-
-## Example output
-
-```
-python -m src.main "Satya Nadella" "CEO" "Microsoft"
-```
-
-```json
-{
-  "current_role": {
-    "value": "Chairman and Chief Executive Officer of Microsoft",
-    "source_urls": ["https://en.wikipedia.org/wiki/Satya_Nadella",
-                    "https://news.microsoft.com/source/exec/satya-nadella"]
-  },
-  "board_seats": {
-    "value": null,
-    "source_urls": [],
-    "note": "No board seats mentioned in the sources."
-  }
-}
-```
-(truncated; full output includes education, prior roles, notable facts, and a summary)
-
-## Known issues
-
-Found on the first real runs; tracked as the next things to fix:
-
-1. **The summary isn't verified.** `verify` checks the five structured fields but not `summary`, so the summary can include details (e.g., a specific month) that no field or source supports.
-2. **Low-specificity, low-quality evidence.** Sources are truncated to 400 characters before extraction, so specifics that appear later on a page (like school names) never reach the model, and weaker sources (user-uploaded documents) can be cited. Planned fix: per-field vector retrieval over full page content, plus source-quality ranking.
-3. **Identity fields can drift.** The model rewrote the input title ("CEO" → "Chairman and Chief Executive Officer"). Name, title, and company should be locked to the input.
-4. **`note` is overused.** It should only explain abstentions, but the model restates the value in it.
-
-## Setup
-
-Requires Python 3.11+.
+## Run
 
 ```bash
-git clone https://github.com/SherylZhang12/exec-profile-agent.git
-cd exec-profile-agent
-python3 -m venv .venv && source .venv/bin/activate
+python3.11 -m venv .venv && source .venv/bin/activate
 python -m pip install -r requirements.txt
-
-cp .env.example .env
-# GOOGLE_API_KEY  — https://aistudio.google.com/apikey
-# TAVILY_API_KEY  — https://app.tavily.com
+cp .env.example .env            # add GOOGLE_API_KEY and TAVILY_API_KEY
+python -m pytest -q             # 8 tests, no keys needed
+python -m src.main "Satya Nadella" "CEO" "Microsoft"                  # rag mode
+python -m src.main "Satya Nadella" "CEO" "Microsoft" --mode baseline  # v1 behaviour
 ```
 
-Run the tests (no API keys needed):
+If the model name 404s, list what your key can use:
+```bash
+python -c "from google import genai; import os; from dotenv import load_dotenv; load_dotenv(); c=genai.Client(api_key=os.environ['GOOGLE_API_KEY']); [print(m.name) for m in c.models.list() if 'flash' in m.name]"
+```
+
+## Evaluate (baseline vs rag)
+
+See `eval/README.md` for how to build the 20–25 person set.
+```bash
+python -m src.agent.evaluate run eval/people.csv --modes baseline rag
+# hand-grade the `grade` column in eval/results_*.csv: C / W / U / M
+python -m src.agent.evaluate score eval/results_baseline.csv eval/results_rag.csv
+```
+
+## Deploy (Cloud Run)
 
 ```bash
-python -m pytest -q
+gcloud run deploy exec-profile-agent --source . --region us-east1 --allow-unauthenticated \
+  --memory 2Gi --set-env-vars GOOGLE_API_KEY=...,TAVILY_API_KEY=...,GEMINI_MODEL=gemini-3.5-flash-lite
+curl -X POST "$URL/profile" -H 'content-type: application/json' \
+  -d '{"name":"Satya Nadella","title":"CEO","company":"Microsoft"}'
 ```
 
-Run the agent:
+## Results
+_(fill in after running the evaluation — hand-graded, N executives)_
 
-```bash
-python -m src.main "<name>" "<title>" "<company>"
-```
+| mode | precision on answered | coverage | correct abstentions | wrong answers | median latency |
+|---|---|---|---|---|---|
+| baseline | | | | | |
+| rag | | | | | |
 
-## Project structure
-
-```
-src/
-  agent/
-    graph.py      # LangGraph nodes, routing, and graph assembly
-    schemas.py    # Pydantic models: Source, Field_, ExecutiveProfile, Verdict
-    prompts.py    # Extraction prompt
-    tools.py      # Web search + Gemini client (with retries)
-    rag.py        # Chroma vector store (in progress)
-    evaluate.py   # Evaluation harness (in progress)
-  main.py         # CLI
-  api.py          # FastAPI service (in progress)
-tests/
-  test_verify.py  # Unit tests for the verify/abstain gate
-```
-
-## Roadmap
-
-- [x] Search → extract → verify → abstain graph with bounded retry
-- [x] Deterministic citation verification with unit tests
-- [ ] Verify the summary against cited fields
-- [ ] Per-field vector retrieval (Chroma) over full page content
-- [ ] Evaluation on a hand-labeled set: accuracy on answered fields, abstention rate, citation validity
-- [ ] FastAPI service deployed on Google Cloud Run
-
-## Stack
-
-Python · LangGraph · LangChain · Gemini API · Tavily · Pydantic · pytest · (planned) Chroma, FastAPI, Docker, Cloud Run
+## Design notes & known limitations
+- The v1 of this system (a research pipeline) enforced "don't fabricate" with prompt rules alone. v2 moves
+  enforcement into code: citations are checked deterministically, and the summary is rebuilt from verified fields.
+- `verify` checks that a cited URL was retrieved, not that the page *entails* the claim. An entailment check
+  (a second model judging claim-vs-chunk) is the next step.
+- The summary check covers numbers/years only; it cannot catch an invented name or school.
+- Secrets are passed as env vars for simplicity; production should use Secret Manager.
+- Only professional, publicly reported information is collected, by design.

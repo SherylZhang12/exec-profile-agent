@@ -1,24 +1,69 @@
-"""Phase 2: vector store over retrieved sources (Chroma). Wire into graph.py after Phase 1 works.
+"""Vector retrieval over the retrieved web pages (Chroma, in-memory, one collection per run).
 
-Why: with many sources per executive, dump them ALL into a vector store and retrieve only the
-chunks relevant to each field (education, board seats, ...) instead of stuffing every snippet
-into one prompt. That is what turns "search-augmented" into a proper RAG pipeline."""
+Why: search snippets are short and often miss the fact we need (e.g. the actual school names
+live deep in a Wikipedia page). We chunk the FULL page text, embed it, and retrieve the most
+relevant chunks for each field separately — so the model sees targeted evidence, not the first
+400 characters of every page."""
+import uuid
 import chromadb
-from chromadb.utils import embedding_functions
-from .schemas import Source
+from .schemas import Source, Chunk
 
-_client = chromadb.PersistentClient(path="chroma_db")
-_embed = embedding_functions.DefaultEmbeddingFunction()  # local, no API key needed
-
-
-def index_sources(person_key: str, sources: list[Source]) -> None:
-    col = _client.get_or_create_collection(name="sources", embedding_function=_embed)
-    col.upsert(ids=[f"{person_key}:{i}" for i in range(len(sources))],
-               documents=[f"{s.title}\n{s.snippet}" for s in sources],
-               metadatas=[{"url": s.url, "person": person_key} for s in sources])
+FIELD_QUERIES = {
+    "current_role": "{name} current position and title at {company}",
+    "education": "{name} education university degree graduated",
+    "prior_roles": "{name} career history previous positions before",
+    "board_seats": "{name} board of directors member serves on board",
+    "notable_facts": "{name} joined company year milestones achievements",
+}
 
 
-def retrieve(person_key: str, question: str, k: int = 4) -> list[Source]:
-    col = _client.get_or_create_collection(name="sources", embedding_function=_embed)
-    r = col.query(query_texts=[question], n_results=k, where={"person": person_key})
-    return [Source(url=m["url"], snippet=d) for d, m in zip(r["documents"][0], r["metadatas"][0])]
+def chunk_text(text: str, size: int = 900, overlap: int = 150) -> list[str]:
+    text = " ".join(text.split())
+    if not text:
+        return []
+    step = size - overlap
+    return [text[i:i + size] for i in range(0, max(len(text) - overlap, 1), step)]
+
+
+class SourceIndex:
+    def __init__(self, embedding_function=None):
+        self._client = chromadb.EphemeralClient()
+        kwargs = {"embedding_function": embedding_function} if embedding_function else {}
+        self._name = "src_" + uuid.uuid4().hex[:10]
+        self._col = self._client.create_collection(self._name, **kwargs)
+        self.n_chunks = 0
+
+    def add(self, sources: list[Source]) -> None:
+        ids, docs, metas = [], [], []
+        for s in sources:
+            for j, c in enumerate(chunk_text(s.raw or s.snippet)):
+                ids.append(f"{self.n_chunks}")
+                docs.append(c)
+                metas.append({"url": s.url, "title": s.title, "j": j})
+                self.n_chunks += 1
+        if ids:
+            self._col.add(ids=ids, documents=docs, metadatas=metas)
+
+    def query(self, question: str, k: int = 4) -> list[Chunk]:
+        if self.n_chunks == 0:
+            return []
+        r = self._col.query(query_texts=[question], n_results=min(k, self.n_chunks))
+        return [Chunk(url=m["url"], text=d) for d, m in zip(r["documents"][0], r["metadatas"][0])]
+
+    def close(self) -> None:
+        try:
+            self._client.delete_collection(self._name)
+        except Exception:
+            pass
+
+
+def retrieve_for_fields(index: SourceIndex, name: str, company: str, k: int = 4) -> list[Chunk]:
+    """Per-field retrieval, de-duplicated, preserving field order."""
+    seen, out = set(), []
+    for q in FIELD_QUERIES.values():
+        for c in index.query(q.format(name=name, company=company), k=k):
+            key = (c.url, c.text[:80])
+            if key not in seen:
+                seen.add(key)
+                out.append(c)
+    return out
