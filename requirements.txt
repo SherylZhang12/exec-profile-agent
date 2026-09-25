@@ -1,0 +1,10 @@
+langgraph>=0.2
+langchain-core>=0.3
+langchain-google-genai>=2.0
+pydantic>=2
+tavily-python>=0.5
+python-dotenv>=1
+chromadb>=0.5          # Phase 2 (vector RAG); safe to install now
+fastapi>=0.110         # Phase 3 (Cloud Run API)
+uvicorn>=0.29
+pytest>=8
