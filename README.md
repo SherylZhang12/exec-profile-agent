@@ -3,6 +3,19 @@
 A LangGraph agent that turns *name + title + company* into a **citation-grounded professional profile**
 of a public-company executive — and leaves a field blank rather than invent it.
 
+## Why this exists
+
+Research on corporate leaders — for example, studying how executives' backgrounds relate to firm
+decisions, or building persona / "digital twin" simulations of decision-makers — needs structured
+background data on hundreds or thousands of people. Collecting it by hand does not scale.
+Asking an LLM directly is fast but unsafe: models fill gaps with plausible-sounding facts and
+citations that were never retrieved, and bad inputs silently corrupt every downstream analysis.
+
+This project takes the middle path: automate the collection (about 15 seconds per profile), but make
+every fact traceable to a page the system actually retrieved, and leave a field blank when the
+evidence is missing. The goal is data a researcher can use without re-checking every line —
+and an evaluation that shows how close it gets.
+
 ```
 START → search → retrieve → extract → verify ─┬─ ok      → summarize → END
             ▲                                 ├─ retry   → search  (max 2 attempts)
